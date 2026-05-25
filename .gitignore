@@ -1,0 +1,26 @@
+# Build artifacts
+dist/
+build/
+release_*/
+build_release_*/
+*.spec
+*.zip
+*.7z
+
+# Playwright bundled browsers
+ms-playwright/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# App runtime data
+*.jsonl
+*.json
+!requirements.txt
