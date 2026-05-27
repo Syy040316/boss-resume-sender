@@ -302,17 +302,62 @@ def now_text() -> str:
 
 
 def split_words(value: str) -> list[str]:
-    return [item.strip() for item in re.split(r"[,，\n;；]+", value) if item.strip()]
+    return [item.strip() for item in re.split(r"[,，\n;；、|]+", value) if item.strip()]
 
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
+BOSS_PRIVATE_DIGIT_TRANSLATION = str.maketrans(
+    {
+        chr(0xE031): "0",
+        chr(0xE032): "1",
+        chr(0xE033): "2",
+        chr(0xE034): "3",
+        chr(0xE035): "4",
+        chr(0xE036): "5",
+        chr(0xE037): "6",
+        chr(0xE038): "7",
+        chr(0xE039): "8",
+        chr(0xE03A): "9",
+    }
+)
+
+
+def decode_boss_private_digits(value: str) -> str:
+    # BOSS uses a custom salary font where private-use chars render as digits.
+    return (value or "").translate(BOSS_PRIVATE_DIGIT_TRANSLATION)
+
+
+def normalize_salary_text(value: str) -> str:
+    text = normalize_text(decode_boss_private_digits(value))
+    if not text:
+        return ""
+    text = text.replace("Ｋ", "K").replace("ｋ", "K")
+    patterns = (
+        r"\d+(?:\.\d+)?\s*[kK]\s*[-~—–至]\s*\d+(?:\.\d+)?\s*[kK](?:\s*[·/]\s*\d+\s*薪)?",
+        r"\d+(?:\.\d+)?\s*[-~—–至]\s*\d+(?:\.\d+)?\s*[kK](?:\s*[·/]\s*\d+\s*薪)?",
+        r"\d+(?:\.\d+)?\s*[kK](?:\s*[·/]\s*\d+\s*薪)?",
+        r"\d+(?:\.\d+)?\s*[-~—–至]\s*\d+(?:\.\d+)?\s*元\s*/\s*(?:天|日)",
+        r"\d+(?:\.\d+)?\s*元\s*/\s*(?:天|日)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return re.sub(r"\s+", "", match.group(0)).replace("—", "-").replace("–", "-").replace("至", "-")
+    return ""
+
+
 def salary_matches(value: str, expected_min_k: int) -> bool:
     if expected_min_k <= 0:
         return True
-    numbers = [int(item) for item in re.findall(r"\d+", value or "")]
+    salary = normalize_salary_text(value)
+    if not salary:
+        return True
+    if "k" not in salary.lower():
+        return True
+    numbers = [float(item) for item in re.findall(r"\d+(?:\.\d+)?", salary)]
     if not numbers:
         return True
     return max(numbers) >= expected_min_k
@@ -321,6 +366,61 @@ def salary_matches(value: str, expected_min_k: int) -> bool:
 def any_word_in_text(words: list[str], text: str) -> bool:
     lowered = text.lower()
     return any(word.lower() in lowered for word in words if word)
+
+
+def normalize_experience_text(text: str) -> str:
+    return normalize_text(decode_boss_private_digits(text)).lower().replace(" ", "")
+
+
+def experience_categories(text: str) -> set[str]:
+    value = normalize_experience_text(text)
+    categories: set[str] = set()
+    if not value:
+        return categories
+    if re.search(r"(在校|实习|实习生|学生)", value):
+        categories.add("student")
+    if re.search(r"(应届|校招|校园招聘|毕业生|届)", value):
+        categories.add("fresh")
+    if re.search(r"(无经验|接受无经验|无需经验|不限经验|经验不限)", value):
+        categories.update({"no_experience", "junior", "under_1_year"})
+    if re.search(r"(初级|助理|入门)", value):
+        categories.update({"junior", "under_1_year"})
+    if re.search(r"(1年以内|1年以下|一年以内|一年以下|0-1年|0至1年|0~1年|0－1年|0–1年|0—1年)", value):
+        categories.update({"under_1_year", "junior"})
+    return categories
+
+
+def experience_keywords_match(keywords: list[str], text: str) -> bool:
+    if any_word_in_text(keywords, text):
+        return True
+    text_categories = experience_categories(text)
+    if not text_categories:
+        return False
+    return any(experience_categories(keyword) & text_categories for keyword in keywords)
+
+
+def text_has_any_experience_signal(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"(在校|实习|应届|校招|校园招聘|毕业生|经验|年以内|年以下|年以上|\d+\s*[-~—–至]\s*\d+\s*年|\d+\s*年|不限经验|经验不限|无经验|初级)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def text_has_any_education_signal(text: str) -> bool:
+    if not text:
+        return False
+    return any(word in text for word in ("学历", "本科", "大专", "硕士", "博士", "高中", "中专", "不限"))
+
+
+def text_has_any_active_signal(text: str) -> bool:
+    if not text:
+        return False
+    return any(word.lower() in text.lower() for word in ("活跃", "在线", "刚刚", "今日", "3日内", "本周", "本月"))
 
 
 def choose_greeting_template(value: str) -> str:
@@ -442,57 +542,81 @@ class BossAutomation:
         self.context = self._launch_context(viewport={"width": 1366, "height": 900})
         page = self._first_page()
         sent_keys = self._load_history()
-        seen_companies: set[str] = set()
         try:
-            for city in options.cities:
-                for keyword in options.keywords:
-                    if self._should_stop(stats, options):
-                        return stats
-                    self.emit("status", f"搜索: {city} / {keyword}", None)
-                    for page_index, jobs in self.iter_search_pages(page, keyword, city, options.max_pages):
-                        self.emit("log", f"{city} / {keyword} 第 {page_index} 页找到 {len(jobs)} 个候选岗位。", None)
-                        if self._should_stop(stats, options):
-                            return stats
-                        for job in jobs:
-                            if self._should_stop(stats, options):
-                                return stats
-                            job.keyword = keyword
-                            job.city = city
-                            company_key = normalize_text(job.company).lower()
-                            if options.unique_company_per_run and company_key and company_key in seen_companies:
-                                self._record(job, "跳过", "本轮已处理同公司")
-                                result = "skipped"
-                            else:
-                                result = self.handle_job(page, job, options, sent_keys)
-                                if options.unique_company_per_run and company_key and result in {"success", "preview", "skipped"}:
-                                    seen_companies.add(company_key)
-                            stats.visited += 1
-                            if result == "success":
-                                stats.success += 1
-                                sent_keys.add(job.history_key)
-                            elif result == "preview":
-                                stats.preview += 1
-                                stats.skipped += 1
-                            elif result == "skipped":
-                                stats.skipped += 1
-                            else:
-                                stats.failed += 1
-                            self.emit(
-                                "progress",
-                                "",
-                                {
-                                    "success": stats.success,
-                                    "skipped": stats.skipped,
-                                    "failed": stats.failed,
-                                    "preview": stats.preview,
-                                    "visited": stats.visited,
-                                    "max_count": options.max_count,
-                                },
-                            )
-                            self._random_sleep(options)
+            self._run_search_loop(page, options, stats, sent_keys)
         finally:
             self.emit("status", "任务结束", None)
         return stats
+
+    def _run_search_loop(self, page: Page, options: RunOptions, stats: RunStats, sent_keys: set[str]) -> None:
+        seen_companies: set[str] = set()
+        for city in options.cities:
+            city_success = 0
+            city_preview = 0
+            self.emit("log", f"开始处理城市: {city}，目标: {options.max_count}", None)
+            for keyword in options.keywords:
+                if self.stop_event.is_set() or self._city_target_reached(city_success, city_preview, options):
+                    break
+                self._emit_progress(stats, options, city, city_success, city_preview)
+                self.emit("status", f"搜索: {city} / {keyword}", None)
+                self.emit("log", f"开始搜索关键词: {keyword}，城市: {city}", None)
+                for page_index, jobs in self.iter_search_pages(page, keyword, city, options.max_pages):
+                    self.emit("log", f"{city} / {keyword} 第 {page_index} 页找到 {len(jobs)} 个候选岗位。", None)
+                    if self.stop_event.is_set() or self._city_target_reached(city_success, city_preview, options):
+                        break
+                    for job in jobs:
+                        if self.stop_event.is_set() or self._city_target_reached(city_success, city_preview, options):
+                            break
+                        job.keyword = keyword
+                        job.city = city
+                        company_key = normalize_text(job.company).lower()
+                        if options.unique_company_per_run and company_key and company_key in seen_companies:
+                            self._record(job, "跳过", "本轮已处理同公司")
+                            result = "skipped"
+                        else:
+                            result = self.handle_job(page, job, options, sent_keys)
+                            if options.unique_company_per_run and company_key and result in {"success", "preview"}:
+                                seen_companies.add(company_key)
+                        stats.visited += 1
+                        if result == "success":
+                            stats.success += 1
+                            city_success += 1
+                            sent_keys.add(job.history_key)
+                        elif result == "preview":
+                            stats.preview += 1
+                            city_preview += 1
+                            stats.skipped += 1
+                        elif result == "skipped":
+                            stats.skipped += 1
+                        else:
+                            stats.failed += 1
+                        self._emit_progress(stats, options, city, city_success, city_preview)
+                        self._random_sleep(options)
+                self.emit("log", f"关键词处理完成: {keyword}，城市: {city}", None)
+            self._emit_progress(stats, options, city, city_success, city_preview)
+            self.emit("log", f"城市处理完成: {city}，成功 {city_success}，预览 {city_preview}，目标 {options.max_count}", None)
+
+    def _city_target_reached(self, city_success: int, city_preview: int, options: RunOptions) -> bool:
+        if options.preview_only:
+            return city_preview >= options.max_count
+        return city_success >= options.max_count
+
+    def _emit_progress(self, stats: RunStats, options: RunOptions, city: str, city_success: int, city_preview: int) -> None:
+        self.emit(
+            "progress",
+            "",
+            {
+                "success": stats.success,
+                "skipped": stats.skipped,
+                "failed": stats.failed,
+                "preview": stats.preview,
+                "visited": stats.visited,
+                "max_count": options.max_count,
+                "city": city,
+                "city_success": city_success,
+                "city_preview": city_preview,
+            },
+        )
 
     def diagnose(self, keyword: str, city: str) -> dict[str, str | int | bool]:
         if sync_playwright is None:
@@ -527,7 +651,7 @@ class BossAutomation:
     def iter_search_pages(self, page: Page, keyword: str, city: str, max_pages: int) -> Iterable[tuple[int, list[JobItem]]]:
         city_code = CITY_CODES.get(city)
         if city_code:
-            page.goto(f"{BOSS_HOME}?query={quote(keyword)}&city={city_code}", wait_until="domcontentloaded", timeout=60000)
+            page.goto(f"{BOSS_HOME}?query={quote(keyword, safe='')}&city={city_code}", wait_until="domcontentloaded", timeout=60000)
         else:
             page.goto(BOSS_HOME, wait_until="domcontentloaded", timeout=60000)
         self._accept_popups(page)
@@ -560,7 +684,7 @@ class BossAutomation:
         if job.history_key in sent_keys:
             self._record(job, "跳过", "历史已处理")
             return "skipped"
-        skip_reason = self._filter_job(job, options)
+        skip_reason = self._filter_job(job, options, detail_loaded=False)
         if skip_reason:
             self._record(job, "跳过", skip_reason)
             return "skipped"
@@ -577,7 +701,7 @@ class BossAutomation:
             detail.goto(job.href, wait_until="domcontentloaded", timeout=60000)
             self._accept_popups(detail)
             self._merge_detail_info(detail, job)
-            detail_skip_reason = self._filter_job(job, options)
+            detail_skip_reason = self._filter_job(job, options, detail_loaded=True)
             if detail_skip_reason:
                 self._record(job, "跳过", detail_skip_reason)
                 return "skipped"
@@ -614,7 +738,7 @@ class BossAutomation:
         finally:
             detail.close()
 
-    def _filter_job(self, job: JobItem, options: RunOptions) -> str | None:
+    def _filter_job(self, job: JobItem, options: RunOptions, detail_loaded: bool = True) -> str | None:
         # Use title + company + tags for keyword matching.  The full page body
         # (detail) is too broad — common words like "培训" appear in job
         # descriptions (e.g. "入职培训") and cause false positives.
@@ -624,11 +748,17 @@ class BossAutomation:
             return "疑似猎头或人力资源服务岗位"
         if any_word_in_text(options.exclude_keywords, short_text):
             return "命中岗位排除词"
-        if options.experience_keywords and not any_word_in_text(options.experience_keywords, full_text):
+        if options.experience_keywords and not experience_keywords_match(options.experience_keywords, full_text):
+            if not detail_loaded and not text_has_any_experience_signal(full_text):
+                return None
             return "不符合经验筛选"
         if options.education_keywords and not any_word_in_text(options.education_keywords, full_text):
+            if not detail_loaded and not text_has_any_education_signal(full_text):
+                return None
             return "不符合学历筛选"
         if options.active_keywords and not any_word_in_text(options.active_keywords, full_text):
+            if not detail_loaded and not text_has_any_active_signal(full_text):
+                return None
             return "不符合 HR 活跃筛选"
         if not salary_matches(job.salary, options.min_salary_k):
             return f"薪资低于 {options.min_salary_k}K"
@@ -928,13 +1058,6 @@ class BossAutomation:
                 except Exception:
                     pass
 
-    def _should_stop(self, stats: RunStats, options: RunOptions) -> bool:
-        if self.stop_event.is_set():
-            return True
-        if options.preview_only:
-            return stats.preview >= options.max_count
-        return stats.success >= options.max_count
-
     def _random_sleep(self, options: RunOptions) -> None:
         delay = random.uniform(options.min_delay, max(options.min_delay, options.max_delay))
         end = time.time() + delay
@@ -1059,14 +1182,14 @@ class BossAutomation:
           const seen = new Set();
           const items = [];
           for (const a of anchors) {
-            const card = a.closest(".job-card-wrapper, li, .job-primary, .job-card-body") || a;
+            const card = a.closest("li.job-card-box, .job-card-wrapper, .job-card-wrap, .job-card-body, .job-primary, [class*='job-card'], li") || a;
             const href = new URL(a.getAttribute("href"), location.origin).href;
             if (seen.has(href)) continue;
             seen.add(href);
-            const titleEl = card.querySelector(".job-name, .job-title, [class*='job-name'], [class*='job-title']") || a;
-            const companyEl = card.querySelector(".company-name, .boss-name, [class*='company'] a, [class*='company-name']");
+            const titleEl = card.querySelector("a.job-name, .job-name, .job-title a, [class*='job-name'], [class*='job-title'] a") || a;
+            const companyEl = card.querySelector(".boss-name, .company-name, [class*='company'] a, [class*='company-name'], [class*='boss-name']");
             const salaryEl = card.querySelector(".salary, .job-salary, [class*='salary']");
-          const tagEls = Array.from(card.querySelectorAll(".tag-list span, .job-labels span, .job-info span, .info-desc, .job-card-footer span, [class*='tag'], [class*='label']"));
+            const tagEls = Array.from(card.querySelectorAll(".tag-list li, .tag-list span, .job-labels span, .job-info span, .info-desc, [class*='tag'] li, [class*='tag'] span, [class*='label']"));
             const title = (titleEl.textContent || a.textContent || "").trim();
             const company = (companyEl && companyEl.textContent || "").trim();
             const salary = (salaryEl && salaryEl.textContent || "").trim();
@@ -1083,9 +1206,9 @@ class BossAutomation:
                 title=normalize_text(row.get("title", "")),
                 company=normalize_text(row.get("company", "")),
                 href=row.get("href", ""),
-                salary=normalize_text(row.get("salary", "")),
-                tags=normalize_text(row.get("tags", "")),
-                detail=normalize_text(row.get("detail", "")),
+                salary=normalize_salary_text(row.get("salary", "")) or normalize_text(decode_boss_private_digits(row.get("salary", ""))),
+                tags=normalize_text(decode_boss_private_digits(row.get("tags", ""))),
+                detail=normalize_text(decode_boss_private_digits(row.get("detail", ""))),
             )
             for row in rows
         ]
@@ -1094,7 +1217,7 @@ class BossAutomation:
         script = """
         () => {
           const salaryEl = document.querySelector(".salary, .job-salary, [class*='salary']");
-          const tagEls = Array.from(document.querySelectorAll(".job-sec-text, .job-labels span, .tag-list span, .job-detail-section span, [class*='tag'], [class*='label']"));
+          const tagEls = Array.from(document.querySelectorAll(".job-sec-text, .job-labels span, .tag-list li, .tag-list span, .job-detail-section span, [class*='tag'] li, [class*='tag'] span, [class*='label']"));
           const body = document.body ? document.body.innerText : "";
           return {
             salary: (salaryEl && salaryEl.textContent || "").trim(),
@@ -1107,11 +1230,12 @@ class BossAutomation:
             row = page.evaluate(script)
         except Exception:
             return
-        job.salary = normalize_text(row.get("salary") or job.salary)
-        detail_tags = normalize_text(row.get("tags", ""))
+        salary = normalize_salary_text(row.get("salary", "")) or normalize_text(decode_boss_private_digits(row.get("salary", "")))
+        job.salary = salary or job.salary
+        detail_tags = normalize_text(decode_boss_private_digits(row.get("tags", "")))
         if detail_tags:
             job.tags = normalize_text(f"{job.tags} {detail_tags}")
-        detail_text = normalize_text(row.get("detail", ""))
+        detail_text = normalize_text(decode_boss_private_digits(row.get("detail", "")))
         if detail_text:
             job.detail = detail_text
 
@@ -1668,14 +1792,19 @@ class BossApp(tk.Tk):
                 success = int(data.get("success", 0))
                 preview = int(data.get("preview", 0))
                 max_count = max(1, int(data.get("max_count", 1)))
+                city = str(data.get("city") or "")
+                city_success = int(data.get("city_success", 0))
+                city_preview = int(data.get("city_preview", 0))
                 self.success_var.set(str(success))
                 self.preview_count_var.set(str(preview))
                 self.skipped_var.set(str(data.get("skipped", 0)))
                 self.failed_var.set(str(data.get("failed", 0)))
                 self.visited_var.set(str(data.get("visited", 0)))
                 self.target_var.set(f"/ {max_count}")
-                active_count = preview if preview else success
+                active_count = city_preview if preview else city_success
                 self.progress_bar.configure(maximum=max_count, value=min(active_count, max_count))
+                if city:
+                    self.status_var.set(f"{city}: {active_count}/{max_count}")
             elif kind == "row" and data:
                 self.add_row(data)
             elif kind == "done":
@@ -1713,6 +1842,9 @@ class BossApp(tk.Tk):
 
 
 def main() -> None:
+    if "--smoke-city-targets" in sys.argv:
+        smoke_city_targets()
+        return
     if "--smoke-browser" in sys.argv:
         smoke_browser()
         return
@@ -1733,6 +1865,41 @@ def main() -> None:
         return
     app = BossApp()
     app.mainloop()
+
+
+def smoke_city_targets() -> None:
+    rows: list[dict] = []
+
+    class FakeAutomation(BossAutomation):
+        def run(self, options: RunOptions) -> RunStats:
+            stats = RunStats()
+            try:
+                self._run_search_loop(None, options, stats, set())  # type: ignore[arg-type]
+            finally:
+                self.emit("status", "任务结束", None)
+            return stats
+
+        def iter_search_pages(self, page: Page, keyword: str, city: str, max_pages: int) -> Iterable[tuple[int, list[JobItem]]]:
+            jobs = [
+                JobItem(title=f"{keyword}-{city}-{index}", company=f"{city}-{keyword}-{index}", href=f"https://example.test/{city}/{keyword}/{index}", salary="10-20K")
+                for index in range(3)
+            ]
+            yield 1, jobs
+
+        def handle_job(self, page: Page, job: JobItem, options: RunOptions, sent_keys: set[str]) -> str:
+            return "success"
+
+    options = RunOptions(["kw1", "kw2"], ["city1", "city2"], 2, 1, "", [], [], [], [], [], 0, False, False, False, True, False, 0.5, 0.5)
+    bot = FakeAutomation(lambda kind, message, data: rows.append({"kind": kind, "message": message, "data": data}), threading.Event())
+    stats = bot.run(options)
+    city_done_logs = [row["message"] for row in rows if row["kind"] == "log" and row["message"].startswith("城市处理完成")]
+    ok = stats.success == 4 and city_done_logs == [
+        "城市处理完成: city1，成功 2，预览 0，目标 2",
+        "城市处理完成: city2，成功 2，预览 0，目标 2",
+    ]
+    print("ok" if ok else f"failed success={stats.success} logs={city_done_logs!r}")
+    if not ok:
+        raise RuntimeError("smoke city targets failed")
 
 
 def smoke_browser() -> None:
@@ -1882,7 +2049,7 @@ def smoke_flow() -> None:
                   <div class="job-card-wrapper">
                     <a class="job-name" href="{detail_path_2.as_uri()}">Python Backend</a>
                     <a class="company-name">Example Tech</a>
-                    <span class="salary">22-32K</span>
+                    <span class="salary">-K</span>
                     <div class="tag-list"><span>3-5 years</span><span>Bachelor</span><span>active-today</span></div>
                   </div>
                 </body></html>
@@ -1923,16 +2090,51 @@ def smoke_flow() -> None:
                 tags="3-5 years Bachelor",
             )
             inactive_skipped = bot._filter_job(inactive_job, options) is not None
+            pending_detail_job = JobItem(
+                title="C++ Developer",
+                company="Pending Detail Tech",
+                href="data:text/html,pending",
+                salary="25-35K",
+                tags="Bachelor active-today",
+            )
+            pending_detail_not_skipped = bot._filter_job(pending_detail_job, options, detail_loaded=False) is None
+            known_experience_job = JobItem(
+                title="C++ Developer",
+                company="Known Experience Tech",
+                href="data:text/html,known",
+                salary="25-35K",
+                tags="3-5年 Bachelor active-today",
+            )
+            known_experience_skipped = bot._filter_job(known_experience_job, RunOptions(["C++"], ["Shanghai"], 1, 1, "Hello", [], [], ["应届生"], ["Bachelor"], ["active"], 20, True, False, True, True, True, 1, 1), detail_loaded=False) is not None
+            fresh_options = RunOptions(["C++"], ["Shanghai"], 1, 1, "Hello", [], [], ["在校生", "应届生", "1年以内"], [], [], 0, True, False, True, True, True, 1, 1)
+            fresh_cases = [
+                JobItem(title="C++开发工程师（校招）", company="A", href="data:text/html,a", salary="10-20K", tags="本科"),
+                JobItem(title="C++开发工程师（接受无经验+线上面试）", company="B", href="data:text/html,b", salary="10-20K", tags="本科"),
+                JobItem(title="C++开发工程师", company="C", href="data:text/html,c", salary="10-20K", tags="经验不限 本科"),
+                JobItem(title="C++开发工程师", company="D", href="data:text/html,d", salary="10-20K", tags="在校/应届 本科"),
+                JobItem(title="初级c++开发工程师", company="E", href="data:text/html,e", salary="10-20K", tags="本科"),
+            ]
+            fresh_cases_match = all(bot._filter_job(case, fresh_options, detail_loaded=True) is None for case in fresh_cases)
+            senior_case_skipped = bot._filter_job(
+                JobItem(title="C++开发工程师", company="F", href="data:text/html,f", salary="10-20K", tags="3-5年 本科"),
+                fresh_options,
+                detail_loaded=True,
+            ) is not None
             ok = (
                 len(jobs) == 2
                 and result == "preview"
                 and rows
                 and rows[-1].get("company") == "Example Tech"
                 and rows[-1].get("salary") == "20-35K"
+                and jobs[1].salary == "22-32K"
                 and jobs[0].history_key not in history_after_preview
                 and second_company_skipped
                 and hunter_skipped
                 and inactive_skipped
+                and pending_detail_not_skipped
+                and known_experience_skipped
+                and fresh_cases_match
+                and senior_case_skipped
             )
             print("ok" if ok else f"failed jobs={len(jobs)} result={result} rows={rows!r}")
             if not ok:
